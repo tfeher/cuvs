@@ -29,19 +29,21 @@
 
 namespace cuvs::neighbors::ivf_pq {
 
-#define CUVS_INST_IVF_PQ_SEARCH(T, IdxT)                                        \
-  void search(raft::resources const& handle,                                    \
+#define CUVS_INST_IVF_PQ_SEARCH_FILTER(T, IdxT)                                 \
+  void search_with_filtering(raft::resources const& handle,                     \
               const cuvs::neighbors::ivf_pq::search_params& params,             \
               cuvs::neighbors::ivf_pq::index<IdxT>& index,                      \
               raft::device_matrix_view<const T, IdxT, raft::row_major> queries, \
               raft::device_matrix_view<IdxT, IdxT, raft::row_major> neighbors,  \
-              raft::device_matrix_view<float, IdxT, raft::row_major> distances) \
+              raft::device_matrix_view<float, IdxT, raft::row_major> distances, \
+              cuvs::neighbors::filtering::bitset_filter<                        \
+                  uint32_t, IdxT> sample_filter)                                \
   {                                                                             \
-    cuvs::neighbors::ivf_pq::detail::search(                                   \
-      handle, params, index, queries, neighbors, distances);  \
+    cuvs::neighbors::ivf_pq::detail::search_with_filtering(                     \
+      handle, params, index, queries, neighbors, distances, sample_filter);     \
   }
-CUVS_INST_IVF_PQ_SEARCH(int8_t, int64_t);
+CUVS_INST_IVF_PQ_SEARCH_FILTER(half, int64_t);
 
-#undef CUVS_INST_IVF_PQ_SEARCH
+#undef CUVS_INST_IVF_PQ_SEARCH_FILTER
 
 }  // namespace cuvs::neighbors::ivf_pq

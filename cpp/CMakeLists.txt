@@ -403,6 +403,7 @@ add_library(
   src/neighbors/ivf_pq/ivf_pq_serialize.cu
   src/neighbors/ivf_pq/ivf_pq_deserialize.cu
   src/neighbors/ivf_pq/detail/ivf_pq_build_extend_float_int64_t.cu
+  src/neighbors/ivf_pq/detail/ivf_pq_build_extend_half_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_build_extend_int8_t_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_build_extend_uint8_t_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_half_fp8_false.cu
@@ -420,6 +421,7 @@ add_library(
   src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_float_fp8_false_bitset64.cu
   src/neighbors/ivf_pq/detail/ivf_pq_compute_similarity_float_fp8_true_bitset64.cu
   src/neighbors/ivf_pq/detail/ivf_pq_search_float_int64_t.cu
+  src/neighbors/ivf_pq/detail/ivf_pq_search_half_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_search_int8_t_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_search_uint8_t_int64_t.cu
   src/neighbors/ivf_pq/detail/ivf_pq_search_with_filter_float_int64_t.cu

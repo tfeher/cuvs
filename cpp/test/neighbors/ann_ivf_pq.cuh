@@ -161,7 +161,7 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
     search_queries.resize(size_t{ps.num_queries} * size_t{ps.dim}, stream_);
 
     raft::random::RngState r(1234ULL);
-    if constexpr (std::is_same<DataT, float>{}) {
+    if constexpr (std::is_same<DataT, float>{} || std::is_same<DataT, half>{}) {
       raft::random::uniform(
         handle_, r, database.data(), ps.num_db_vecs * ps.dim, DataT(0.1), DataT(2.0));
       raft::random::uniform(
@@ -516,7 +516,7 @@ class ivf_pq_filter_test : public ::testing::TestWithParam<ivf_pq_inputs> {
     search_queries.resize(size_t{ps.num_queries} * size_t{ps.dim}, stream_);
 
     raft::random::RngState r(1234ULL);
-    if constexpr (std::is_same<DataT, float>{}) {
+    if constexpr (std::is_same<DataT, float>{} || std::is_same<DataT, half>{}) {
       raft::random::uniform(
         handle_, r, database.data(), ps.num_db_vecs * ps.dim, DataT(0.1), DataT(2.0));
       raft::random::uniform(

@@ -117,6 +117,7 @@ if(BUILD_TESTS)
     NAME
     NEIGHBORS_ANN_IVF_PQ_TEST
     PATH
+    test/neighbors/ann_ivf_pq/test_half_int64_t.cu
     test/neighbors/ann_ivf_pq/test_float_int64_t.cu
     test/neighbors/ann_ivf_pq/test_int8_t_int64_t.cu
     test/neighbors/ann_ivf_pq/test_uint8_t_int64_t.cu

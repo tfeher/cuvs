@@ -40,7 +40,7 @@ namespace cuvs::neighbors::ivf_pq {
     cuvs::neighbors::ivf_pq::detail::search(                                   \
       handle, params, index, queries, neighbors, distances);  \
   }
-CUVS_INST_IVF_PQ_SEARCH(int8_t, int64_t);
+CUVS_INST_IVF_PQ_SEARCH(half, int64_t);
 
 #undef CUVS_INST_IVF_PQ_SEARCH
 
