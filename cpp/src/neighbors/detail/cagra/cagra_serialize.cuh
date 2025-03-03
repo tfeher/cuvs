@@ -107,7 +107,7 @@ void serialize_to_hnswlib(
   //               "An hnswlib index can only be trained with int32 or uint32 IdxT");
   int dim = (dataset) ? dataset->extent(1) : index_.dim();
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope("cagra::serialize");
-  RAFT_LOG_DEBUG("Saving CAGRA index to hnswlib format, size %zu, dim %u",
+  RAFT_LOG_INFO("Saving CAGRA index to hnswlib format, size %zu, dim %u",
                  static_cast<size_t>(index_.size()),
                  dim);
 
@@ -218,7 +218,7 @@ void serialize_to_hnswlib(
       float throughput      = bytes_written / GiB / time;
       float rows_throughput = i / time;
       float ETA             = (index_.size() - i) / rows_throughput;
-      RAFT_LOG_DEBUG(
+      RAFT_LOG_INFO(
         "# Writing rows %12lu / %12lu (%3.2f %%), %3.2f GiB/sec, ETA %d:%3.1f, written %3.2f GiB\r",
         i,
         index_.size(),

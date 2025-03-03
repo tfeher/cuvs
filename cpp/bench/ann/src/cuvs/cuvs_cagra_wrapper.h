@@ -51,7 +51,7 @@
 namespace cuvs::bench {
 
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
-enum class CagraBuildAlgo { kAuto, kIvfPq, kNnDescent };
+enum class CagraBuildAlgo { kAuto, kIvfPq, kNnDescent, kFile, kIterative };
 
 template <typename T, typename IdxT>
 class cuvs_cagra : public algo<T>, public algo_gpu {
@@ -76,6 +76,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   struct build_param {
     cuvs::neighbors::cagra::index_params cagra_params;
     CagraBuildAlgo algo;
+    int file_flag                                                              = 0;
     std::optional<cuvs::neighbors::nn_descent::index_params> nn_descent_params = std::nullopt;
     std::optional<float> ivf_pq_refine_rate                                    = std::nullopt;
     std::optional<cuvs::neighbors::ivf_pq::index_params> ivf_pq_build_params   = std::nullopt;
@@ -95,6 +96,15 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
           cagra_params.intermediate_graph_degree);
         if (nn_descent_params) { nn_params = *nn_descent_params; }
         cagra_params.graph_build_params = nn_params;
+      } else if (algo == CagraBuildAlgo::kFile) {
+        cuvs::neighbors::cagra::graph_build_params::file file_param{file_flag};
+        // fileparam {0} == read from knn_graph.npy continue with graph optim
+        // fileparam {1} == read from cagra_graph.npy already optimized graph
+        // fileparam {2} == read knn_graph, slice it into a cagra graph without optimization
+        cagra_params.graph_build_params = file_param;
+      } else if (algo == CagraBuildAlgo::kIterative) {
+        cuvs::neighbors::cagra::graph_build_params::iterative_search_params p;
+        cagra_params.graph_build_params = p;
       }
     }
   };

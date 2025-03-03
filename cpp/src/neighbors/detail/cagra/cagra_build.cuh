@@ -19,7 +19,9 @@
 #include "../../vpq_dataset.cuh"
 #include "graph_core.cuh"
 #include <cuvs/neighbors/cagra.hpp>
+#include <fstream>
 
+#include <raft/core/detail/mdspan_numpy_serializer.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
@@ -28,6 +30,7 @@
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/logger.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/serialize.hpp>
 
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/ivf_pq.hpp>
@@ -41,7 +44,10 @@
 #include <rmm/resource_ref.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <iostream>
+#include <random>
 #include <vector>
 
 namespace cuvs::neighbors::cagra::detail {
@@ -151,7 +157,7 @@ void build_knn_graph(
     return std::string(model_name);
   }();
 
-  RAFT_LOG_DEBUG("# Building IVF-PQ index %s", model_name.c_str());
+  RAFT_LOG_INFO("# Building IVF-PQ index %s", model_name.c_str());
   auto index = cuvs::neighbors::ivf_pq::build(res, pq.build_params, dataset);
 
   //
@@ -184,7 +190,7 @@ void build_knn_graph(
       ? raft::resource::get_workspace_resource(res)
       : raft::resource::get_large_workspace_resource(res);
 
-  RAFT_LOG_DEBUG(
+  RAFT_LOG_INFO(
     "IVF-PQ search node_degree: %d, top_k: %d,  gpu_top_k: %d,  max_batch_size:: %d, n_probes: %u",
     node_degree,
     top_k,
@@ -329,21 +335,22 @@ void build_knn_graph(
         std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
         1e-6;
       const auto throughput = num_queries_done / time;
-
-      RAFT_LOG_DEBUG(
-        "# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %.2f minutes ETA, self included = "
+      float ETA             = (num_queries - num_queries_done) / throughput;
+      RAFT_LOG_INFO(
+        "# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %d:%3.1f (mm:ss) ETA, self included = "
         "%3.2f %%    \r",
         num_queries_done,
         dataset.extent(0),
         num_queries_done / static_cast<double>(dataset.extent(0)) * 100,
         throughput,
-        (num_queries - num_queries_done) / throughput / 60,
+        int(ETA / 60),
+        std::fmod(ETA, 60.0f),
         static_cast<double>(num_self_included) / num_queries_done * 100.);
     }
     first = false;
   }
 
-  if (!first) RAFT_LOG_DEBUG("# Finished building kNN graph");
+  if (!first) RAFT_LOG_INFO("# Finished building kNN graph");
 }
 
 template <typename DataT, typename IdxT, typename accessor>
@@ -491,6 +498,8 @@ auto iterative_build_graph(
                    (uint64_t)curr_graph_size,
                    (double)curr_graph_size / final_graph_size);
 
+    auto start_clock = std::chrono::system_clock::now();
+
     auto curr_query_size   = std::min(2 * curr_graph_size, final_graph_size);
     auto curr_topk         = small_topk;
     auto curr_itopk_size   = small_topk * 3 / 2;
@@ -550,6 +559,17 @@ auto iterative_build_graph(
                  raft::resource::get_cuda_stream(res));
     }
 
+    auto time = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::system_clock::now() - start_clock)
+                  .count() *
+                1e-6;
+    const auto throughput = curr_query_size / time;
+    RAFT_LOG_INFO("Searched %d vectors in %d sce,  throughput %d kvec/sec",
+                  (int)curr_query_size,
+                  (int)time,
+                  int(throughput / 1000));
+
+    start_clock = std::chrono::system_clock::now();
     // Optimize graph
     bool flag_last  = (curr_graph_size == final_graph_size);
     curr_graph_size = curr_query_size;
@@ -557,6 +577,11 @@ auto iterative_build_graph(
     cagra_graph     = raft::make_host_matrix<IdxT, int64_t>(curr_graph_size, curr_graph_degree);
     optimize<IdxT>(
       res, neighbors.view(), cagra_graph.view(), flag_last ? params.guarantee_connectivity : 0);
+    time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                            start_clock)
+             .count();
+    RAFT_LOG_INFO("Graph optimized in %d seconds", (int)time);
+
     if (flag_last) { break; }
   }
 
@@ -589,13 +614,15 @@ index<T, IdxT> build(
     graph_degree = intermediate_degree;
   }
 
+  auto start_clock = std::chrono::system_clock::now();
+
   // Set default value in case knn_build_params is not defined.
   auto knn_build_params = params.graph_build_params;
   if (std::holds_alternative<std::monostate>(params.graph_build_params)) {
     // Heuristic to decide default build algo and its params.
     if (cuvs::neighbors::nn_descent::has_enough_device_memory(
           res, dataset.extents(), sizeof(IdxT))) {
-      RAFT_LOG_DEBUG("NN descent solver");
+      RAFT_LOG_INFO("NN descent solver");
       knn_build_params =
         cagra::graph_build_params::nn_descent_params(intermediate_degree, params.metric);
     } else {
@@ -615,11 +642,63 @@ index<T, IdxT> build(
   if (std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
         knn_build_params)) {
     cagra_graph = iterative_build_graph<T, IdxT, Accessor>(res, params, dataset);
+    int time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                                start_clock)
+                 .count();
+    RAFT_LOG_INFO("CAGRA graph built in %d:%d seconds", time / 60, time % 60);
   } else {
     std::optional<raft::host_matrix<IdxT, int64_t>> knn_graph(
       raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), intermediate_degree));
 
-    if (std::holds_alternative<cagra::graph_build_params::ivf_pq_params>(knn_build_params)) {
+    if (std::holds_alternative<cagra::graph_build_params::file>(knn_build_params)) {
+      auto file_param = std::get<cagra::graph_build_params::file>(knn_build_params);
+      if (file_param.flag == 0) {
+        // Deserialize graph
+        std::ifstream is("knn_graph.npy", std::ios::in | std::ios::binary);
+        raft::detail::numpy_serializer::header_t header =
+          raft::detail::numpy_serializer::read_header(is);
+        is.seekg(0);  // rewind
+        knn_graph = raft::make_host_matrix<IdxT, int64_t>(header.shape[0], header.shape[1]);
+        raft::deserialize_mdspan(res, is, knn_graph->view());
+        RAFT_LOG_INFO("Read KNN graph from file knn_graph.npy, shape %dx%d",
+                      static_cast<int>(knn_graph->extent(0)),
+                      static_cast<int>(knn_graph->extent(1)));
+        is.close();
+      } else if (file_param.flag == 1) {
+        // We will read cagra_graph
+        std::ifstream is("cagra_graph.npy", std::ios::in | std::ios::binary);
+        raft::detail::numpy_serializer::header_t header =
+          raft::detail::numpy_serializer::read_header(is);
+        is.seekg(0);  // rewind
+        RAFT_LOG_INFO("Creating  CAGRA to read it from file");
+
+        cagra_graph = raft::make_host_matrix<IdxT, int64_t>(header.shape[0], header.shape[1]);
+        raft::deserialize_mdspan(res, is, cagra_graph.view());
+        RAFT_LOG_INFO("Read CAGRA graph from file cagra_graph.npy.npy, shape %dx%d",
+                      static_cast<int>(cagra_graph.extent(0)),
+                      static_cast<int>(cagra_graph.extent(1)));
+        is.close();
+      } else if (file_param.flag == 2) {
+        // Deserialize graph
+        std::ifstream is("knn_graph.npy", std::ios::in | std::ios::binary);
+        raft::detail::numpy_serializer::header_t header =
+          raft::detail::numpy_serializer::read_header(is);
+        is.seekg(0);  // rewind
+        knn_graph = raft::make_host_matrix<IdxT, int64_t>(header.shape[0], header.shape[1]);
+        raft::deserialize_mdspan(res, is, knn_graph->view());
+        is.close();
+        RAFT_LOG_INFO("Read KNN graph from file knn_graph.npy, shape %dx%d",
+                      static_cast<int>(knn_graph->extent(0)),
+                      static_cast<int>(knn_graph->extent(1)));
+        RAFT_LOG_INFO("Slicing CAGRA graph");
+        cagra_graph =
+          raft::make_host_matrix<IdxT, int64_t>(knn_graph->extent(0), params.graph_degree);
+#pragma omp parallel for
+        for (auto i = 0; i < cagra_graph.extent(0); i++) {
+          memcpy(&cagra_graph(i, 0), &(*knn_graph)(i, 0), cagra_graph.extent(1) * sizeof(IdxT));
+        }
+      }
+    } else if (std::holds_alternative<cagra::graph_build_params::ivf_pq_params>(knn_build_params)) {
       auto ivf_pq_params =
         std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(knn_build_params);
       build_knn_graph(res, dataset, knn_graph->view(), ivf_pq_params);
@@ -643,16 +722,46 @@ index<T, IdxT> build(
       build_knn_graph<T, IdxT>(res, dataset, knn_graph->view(), nn_descent_params);
     }
 
+    int time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                                start_clock)
+                 .count();
+    RAFT_LOG_INFO("KNN graph built in %d:%d seconds", time / 60, time % 60);
+
+    float GiB   = 1 << 30;
+    float hsize = knn_graph->size() * sizeof(IdxT) / GiB;
+    RAFT_LOG_INFO("KNN graph size %f GiB", hsize);
+    if (!std::holds_alternative<cagra::graph_build_params::file>(knn_build_params)) {
+      start_clock = std::chrono::system_clock::now();
+      std::ofstream of("knn_graph.npy", std::ios::out | std::ios::binary);
+      if (!of) { RAFT_FAIL("Cannot open file knn_graph.npy"); }
+
+      raft::serialize_mdspan(res, of, knn_graph->view());
+      of.close();
+      if (!of) { RAFT_FAIL("Error writing knn graph"); }
+      time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                              start_clock)
+               .count();
+      RAFT_LOG_INFO("KNN graph written to disk in %d sec", time);
+    }
+    if (cagra_graph.size() == 0) {
     cagra_graph = raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), graph_degree);
+      hsize       = cagra_graph.size() * sizeof(typename decltype(cagra_graph)::element_type) / GiB;
+      RAFT_LOG_INFO("CAGRA graph size %f GiB", hsize);
 
     RAFT_LOG_INFO("optimizing graph");
-    optimize<IdxT>(res, knn_graph->view(), cagra_graph.view(), params.guarantee_connectivity);
 
+      start_clock = std::chrono::system_clock::now();
+
+      optimize<IdxT>(res, knn_graph->view(), cagra_graph.view(), params.guarantee_connectivity);
+      time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                              start_clock)
+               .count();
     // free intermediate graph before trying to create the index
+      RAFT_LOG_INFO("Graph optimized in %d:%d seconds, creating index", time / 60, time % 60);
+      // }
+    }
     knn_graph.reset();
   }
-
-  RAFT_LOG_INFO("Graph optimized, creating index");
 
   // Construct an index from dataset and optimized knn graph.
   if (params.compression.has_value()) {
@@ -686,7 +795,7 @@ index<T, IdxT> build(
     }
   }
   index<T, IdxT> idx(res, params.metric);
-  idx.update_graph(res, raft::make_const_mdspan(cagra_graph.view()));
+  idx.move_graph(res, std::move(cagra_graph));
   return idx;
 }
 }  // namespace cuvs::neighbors::cagra::detail

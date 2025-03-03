@@ -98,7 +98,7 @@ void cuvs_cagra_hnswlib<T, IdxT>::build(const T* dataset, size_t nrow)
   int time =
     std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start_clock)
       .count();
-  RAFT_LOG_DEBUG("Graph saved to HNSW format in %d:%d min", time / 60, time % 60);
+  RAFT_LOG_INFO("Graph saved to HNSW format in %d:%d min", time / 60, time % 60);
 }
 
 template <typename T, typename IdxT>

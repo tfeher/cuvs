@@ -65,7 +65,10 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scan.h>
 
+#include <chrono>
+#include <fstream>
 #include <memory>
+#include <raft/core/serialize.hpp>
 #include <variant>
 
 namespace cuvs::neighbors::ivf_pq::detail {
@@ -1578,6 +1581,11 @@ void extend(raft::resources const& handle,
                                     cudaMemcpyDefault,
                                     stream));
     vec_batches.prefetch_next_batch();
+
+    RAFT_LOG_INFO("Assigning vectors to clusters");
+    const auto start_clock    = std::chrono::system_clock::now();
+    size_t d_report_offset    = n_rows / 100;  // Report progress in 1% steps.
+    size_t next_report_offset = d_report_offset;
     for (const auto& batch : vec_batches) {
       auto batch_data_view = raft::make_device_matrix_view<const T, internal_extents_t>(
         batch.data(), batch.size(), index->dim());
@@ -1597,6 +1605,25 @@ void extend(raft::resources const& handle,
       // User needs to make sure kernel finishes its work before we overwrite batch in the next
       // iteration if different streams are used for kernel and copy.
       raft::resource::sync_stream(handle);
+      size_t num_queries_done = batch.offset() + batch.size();
+      const auto end_clock    = std::chrono::system_clock::now();
+      if (batch.offset() > next_report_offset) {
+        next_report_offset += d_report_offset;
+        const auto time =
+          std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+          1e-6;
+        const auto throughput = num_queries_done / time;
+        float ETA             = (n_rows - num_queries_done) / throughput;
+        RAFT_LOG_INFO(
+          "# IVF-PQ assign vectors to clusters: %12lu / %12lu (%3.2f %%), %e vec/sec, %d:%3.1f "
+          "minutes "
+          "ETA\r",
+          num_queries_done,
+          n_rows,
+          num_queries_done / static_cast<double>(n_rows) * 100,
+          throughput,
+          int(ETA / 60),
+          std::fmod(ETA, 60.0f));
     }
   }
 
@@ -1640,6 +1667,10 @@ void extend(raft::resources const& handle,
     new_indices, n_rows, 1, max_batch_size, stream, batches_mr);
   vec_batches.reset();
   vec_batches.prefetch_next_batch();
+  const auto start_clock    = std::chrono::system_clock::now();
+  size_t d_report_offset    = n_rows / 100;  // Report progress in 1% steps.
+  size_t next_report_offset = d_report_offset;
+
   for (const auto& vec_batch : vec_batches) {
     const auto& idx_batch = *idx_batches++;
     if (index->metric() == CosineExpanded) {
@@ -1663,6 +1694,24 @@ void extend(raft::resources const& handle,
     // User needs to make sure kernel finishes its work before we overwrite batch in the next
     // iteration if different streams are used for kernel and copy.
     raft::resource::sync_stream(handle);
+    size_t num_queries_done = vec_batch.offset() + vec_batch.size();
+    const auto end_clock    = std::chrono::system_clock::now();
+    if (vec_batch.offset() > next_report_offset) {
+      next_report_offset += d_report_offset;
+      const auto time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+        1e-6;
+      const auto throughput = num_queries_done / time;
+      float ETA             = (n_rows - num_queries_done) / throughput;
+      RAFT_LOG_INFO(
+        "# IVF-PQ encode vectors: %12lu / %12lu (%3.2f %%), %e vecs/sec, %d:%3.1f minutes ETA\r",
+        num_queries_done,
+        n_rows,
+        num_queries_done / static_cast<double>(n_rows) * 100,
+        throughput,
+        int(ETA / 60),
+        std::fmod(ETA, 60.0f));
+    }
   }
 }
 

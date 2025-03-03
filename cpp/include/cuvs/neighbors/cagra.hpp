@@ -76,6 +76,9 @@ using nn_descent_params = cuvs::neighbors::nn_descent::index_params;
 // **** Experimental ****
 using iterative_search_params = cuvs::neighbors::search_params;
 
+struct file {
+  int flag;
+};
 }  // namespace graph_build_params
 
 struct index_params : cuvs::neighbors::index_params {
@@ -113,7 +116,8 @@ struct index_params : cuvs::neighbors::index_params {
   std::variant<std::monostate,
                graph_build_params::ivf_pq_params,
                graph_build_params::nn_descent_params,
-               graph_build_params::iterative_search_params>
+               graph_build_params::iterative_search_params,
+               graph_build_params::file>
     graph_build_params;
 
   /**
@@ -400,6 +404,7 @@ struct index : cuvs::neighbors::index {
     : cuvs::neighbors::index(),
       metric_(metric),
       graph_(raft::make_device_matrix<IdxT, int64_t>(res, 0, 0)),
+      host_graph_(raft::make_host_matrix<IdxT, int64_t>(0, 0)),
       dataset_(new cuvs::neighbors::empty_dataset<int64_t>(0))
   {
   }
@@ -466,6 +471,7 @@ struct index : cuvs::neighbors::index {
     : cuvs::neighbors::index(),
       metric_(metric),
       graph_(raft::make_device_matrix<IdxT, int64_t>(res, 0, 0)),
+      host_graph_(raft::make_host_matrix<IdxT, int64_t>(0, 0)),
       dataset_(make_aligned_dataset(res, dataset, 16))
   {
     RAFT_EXPECTS(dataset.extent(0) == knn_graph.extent(0),
@@ -545,7 +551,7 @@ struct index : cuvs::neighbors::index {
   void update_graph(raft::resources const& res,
                     raft::host_matrix_view<const IdxT, int64_t, raft::row_major> knn_graph)
   {
-    RAFT_LOG_DEBUG("Copying CAGRA knn graph from host to device");
+    RAFT_LOG_INFO("Copying CAGRA knn graph from host to device");
 
     if ((graph_.extent(0) != knn_graph.extent(0)) || (graph_.extent(1) != knn_graph.extent(1))) {
       // clear existing memory before allocating to prevent OOM errors on large graphs
@@ -560,9 +566,31 @@ struct index : cuvs::neighbors::index {
     graph_view_ = graph_.view();
   }
 
+  /**
+   * Replace the graph with a new graph.
+   *
+   * We create a copy of the graph on the device. The index manages the lifetime of this copy.
+   */
+  void move_graph(raft::resources const& res,
+                  raft::host_matrix<IdxT, int64_t, raft::row_major>&& knn_graph)
+  {
+    RAFT_LOG_INFO("Moving host graph to index and registering for managed access");
+
+    if ((graph_.extent(0) != knn_graph.extent(0)) || (graph_.extent(1) != knn_graph.extent(1))) {
+      // clear existing memory before allocating to prevent OOM errors on large graphs
+      if (graph_.size()) { graph_ = raft::make_device_matrix<IdxT, int64_t>(res, 0, 0); }
+    }
+    host_graph_ = std::move(knn_graph);
+    RAFT_CUDA_TRY(cudaHostRegister(
+      host_graph_.data_handle(), host_graph_.size() * sizeof(IdxT), cudaHostRegisterMapped));
+    graph_view_ = raft::make_device_matrix_view(
+      host_graph_.data_handle(), host_graph_.extent(0), host_graph_.extent(1));
+  }
+
  private:
   cuvs::distance::DistanceType metric_;
   raft::device_matrix<IdxT, int64_t, raft::row_major> graph_;
+  raft::host_matrix<IdxT, int64_t, raft::row_major> host_graph_;
   raft::device_matrix_view<const IdxT, int64_t, raft::row_major> graph_view_;
   std::unique_ptr<neighbors::dataset<dataset_index_type>> dataset_;
 };
@@ -574,6 +602,21 @@ struct index : cuvs::neighbors::index {
  * @defgroup cagra_cpp_index_build CAGRA index build functions
  * @{
  */
+
+void build_knn_graph(raft::resources const& res,
+                     raft::host_matrix_view<const float, int64_t, raft::row_major> dataset,
+                     raft::host_matrix_view<uint32_t, int64_t, raft::row_major> knn_graph,
+                     cuvs::neighbors::cagra::graph_build_params::ivf_pq_params pq);
+
+void build_knn_graph(raft::resources const& res,
+                     raft::host_matrix_view<const int8_t, int64_t, raft::row_major> dataset,
+                     raft::host_matrix_view<uint32_t, int64_t, raft::row_major> knn_graph,
+                     cuvs::neighbors::cagra::graph_build_params::ivf_pq_params pq);
+
+void build_knn_graph(raft::resources const& res,
+                     raft::host_matrix_view<const uint8_t, int64_t, raft::row_major> dataset,
+                     raft::host_matrix_view<uint32_t, int64_t, raft::row_major> knn_graph,
+                     cuvs::neighbors::cagra::graph_build_params::ivf_pq_params pq);
 
 /**
  * @brief Build the index from the dataset for efficient search.

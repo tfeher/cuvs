@@ -18,7 +18,10 @@
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/hnsw.hpp>
+#include <cuvs/neighbors/ivf_pq.hpp>
 #include <filesystem>
+
+#include <cuvs/neighbors/cagra.hpp>
 #include <hnswlib/hnswalg.h>
 #include <hnswlib/hnswlib.h>
 #include <memory>
@@ -126,6 +129,9 @@ std::enable_if_t<hierarchy == HnswHierarchy::NONE, std::unique_ptr<index<T>>> fr
   std::uniform_int_distribution<std::mt19937::result_type> dist(0);
   auto uuid            = std::to_string(dist(rng));
   std::string filepath = "/tmp/" + uuid + ".bin";
+  RAFT_LOG_INFO("cagra::serialize_to_hnswlib dataset dim %d, n_vecs %d",
+                static_cast<int>(cagra_index.dim()),
+                static_cast<int>(cagra_index.size()));
   cuvs::neighbors::cagra::serialize_to_hnswlib(res, filepath, cagra_index, dataset);
 
   index<T>* hnsw_index = nullptr;
@@ -174,6 +180,9 @@ std::enable_if_t<hierarchy == HnswHierarchy::CPU, std::unique_ptr<index<T>>> fro
     host_dataset_view = host_dataset.view();
   }
   // build upper layers of hnsw index
+  RAFT_LOG_INFO("hnsw::from_cagra dataset %dx%d",
+                static_cast<int>(host_dataset_view.extent(0)),
+                static_cast<int>(host_dataset_view.extent(1)));
   int dim         = host_dataset_view.extent(1);
   auto hnsw_index = std::make_unique<index_impl<T>>(dim, cagra_index.metric(), hierarchy);
   auto appr_algo  = std::make_unique<hnswlib::HierarchicalNSW<typename hnsw_dist_t<T>::type>>(
@@ -271,6 +280,7 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
   const cuvs::neighbors::cagra::index<T, uint32_t>& cagra_index,
   std::optional<raft::host_matrix_view<const T, int64_t, raft::row_major>> dataset)
 {
+  RAFT_LOG_INFO("Running from_cagra, GPU version");
   auto host_dataset = raft::make_host_matrix<T, int64_t>(0, 0);
   raft::host_matrix_view<const T, int64_t, raft::row_major> host_dataset_view(
     host_dataset.data_handle(), host_dataset.extent(0), host_dataset.extent(1));
@@ -292,7 +302,7 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     raft::resource::sync_stream(res);
     host_dataset_view = host_dataset.view();
   }
-
+  RAFT_LOG_INFO("Host dataset view created");
   // initialize hnsw index
   auto hnsw_index =
     std::make_unique<index_impl<T>>(host_dataset_view.extent(1), cagra_index.metric(), hierarchy);
@@ -301,6 +311,8 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     host_dataset_view.extent(0),
     cagra_index.graph().extent(1) / 2,
     params.ef_construction);
+  RAFT_LOG_INFO("HNSW index initialized");
+  auto start_clock = std::chrono::system_clock::now();
 
   // assign a level to each point and initialize the points in hnsw
   std::vector<size_t> levels(host_dataset_view.extent(0));
@@ -313,7 +325,11 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     hnsw_internal_ids[i] =
       initialize_point_in_hnsw(appr_algo.get(), host_dataset_view, i, levels[i] - 1);
   }
-
+  int time =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start_clock)
+      .count();
+  RAFT_LOG_INFO("Points in HNSW index initialized in %d sec", time);
+  start_clock = std::chrono::system_clock::now();
   // sort the points by levels
   // build histogram
   std::vector<size_t> hist;
@@ -336,13 +352,19 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     auto pt_level              = levels[i] - 1;
     order[offsets[pt_level]++] = i;
   }
-
+  time =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start_clock)
+      .count();
+  RAFT_LOG_INFO("HNSW layers sorted in %d sec", time);
   // set last point of the highest level as the entry point
   appr_algo->enterpoint_node_ = hnsw_internal_ids[order.back()];
   appr_algo->maxlevel_        = hist.size() - 1;
 
+  start_clock = std::chrono::system_clock::now();
+
   // iterate over the points in the descending order of their levels
   for (size_t pt_level = hist.size() - 1; pt_level >= 1; pt_level--) {
+    RAFT_LOG_INFO("Processing hnsw level %d", int(pt_level));
     auto start_idx     = offsets[pt_level - 1];
     auto end_idx       = offsets[hist.size() - 1];
     auto num_pts       = end_idx - start_idx;
@@ -353,6 +375,8 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     }
 
     // gather points from dataset to form query set on host
+    RAFT_LOG_INFO(
+      "creating host query set, size %dx%d", int(num_pts), int(host_dataset_view.extent(1)));
     auto host_query_set = raft::make_host_matrix<T, int64_t>(num_pts, host_dataset_view.extent(1));
     // TODO: Use `raft::matrix::gather` when available as a public API
     // Issue: https://github.com/rapidsai/raft/issues/2572
@@ -364,23 +388,42 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
                 &host_query_set(i - start_idx, 0));
     }
 
-    // find neighbors of the query set
-    auto host_neighbors = raft::make_host_matrix<uint32_t, int64_t>(num_pts, neighbor_size);
-    all_neighbors_graph(res,
-                        raft::make_const_mdspan(host_query_set.view()),
-                        host_neighbors.view(),
+    /// IVF-PQ
+    RAFT_LOG_INFO("creating knn_graph, size %d, %d", int(num_pts), int(neighbor_size));
+    auto host_neighbors_full = raft::make_host_matrix<uint32_t, int64_t>(num_pts, neighbor_size);
+    auto pq = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params(host_query_set.extents(),
                         cagra_index.metric());
+    cuvs::neighbors::cagra::build_knn_graph(
+      res, raft::make_const_mdspan(host_query_set.view()), host_neighbors_full.view(), pq);
+
+    //     // Need to slice the first column of the neighbors matrix because it's the query point
+    //     itself auto host_neighbors = raft::make_host_matrix<uint32_t, int64_t>(num_pts,
+    //     neighbor_size - 1);
+    // #pragma omp parallel for
+    //     for (int64_t i = 0; i < host_neighbors.extent(0); i++) {
+    //       std::copy(host_neighbors_full.data_handle() + i * host_neighbors_full.extent(1) + 1,
+    //                 host_neighbors_full.data_handle() + (i + 1) * host_neighbors_full.extent(1),
+    //                 host_neighbors.data_handle() + i * host_neighbors.extent(1));
+    //     }
+    // /// NN-DESCENT
+    // // find neighbors of the query set
+    // auto host_neighbors = raft::make_host_matrix<uint32_t, int64_t>(num_pts, neighbor_size);
+    // all_neighbors_graph(res,
+    //                     raft::make_const_mdspan(host_query_set.view()),
+    //                     host_neighbors.view(),
+    //                     cagra_index.metric());
 
     // add points to the HNSW index upper layers
+    neighbor_size--;  // discard self neighbor
 #pragma omp parallel for num_threads(num_threads)
     for (auto i = start_idx; i < end_idx; i++) {
       auto pt_id       = order[i];
       auto internal_id = hnsw_internal_ids[pt_id];
       auto ll_cur      = appr_algo->get_linklist(internal_id, pt_level);
-      appr_algo->setListCount(ll_cur, host_neighbors.extent(1));
+      appr_algo->setListCount(ll_cur, neighbor_size);
       auto* data     = (uint32_t*)(ll_cur + 1);
-      auto neighbors = &host_neighbors(i - start_idx, 0);
-      for (auto j = 0; j < host_neighbors.extent(1); j++) {
+      auto neighbors = &host_neighbors_full(i - start_idx, 1);
+      for (int j = 0; j < static_cast<int>(neighbor_size); j++) {
         auto neighbor_id          = order[neighbors[j] + start_idx];
         auto neighbor_internal_id = hnsw_internal_ids[neighbor_id];
         data[j]                   = neighbor_internal_id;
@@ -414,6 +457,10 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     }
   }
 
+  time =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start_clock)
+      .count();
+  RAFT_LOG_INFO("HNSW KNN layers created in %d sec", time);
   hnsw_index->set_index(std::move(appr_algo));
   return hnsw_index;
 }
@@ -426,10 +473,13 @@ std::unique_ptr<index<T>> from_cagra(
   std::optional<raft::host_matrix_view<const T, int64_t, raft::row_major>> dataset)
 {
   if (params.hierarchy == HnswHierarchy::NONE) {
+    RAFT_LOG_INFO("hnsw::from_cagra without hierarchy");
     return from_cagra<T, HnswHierarchy::NONE>(res, params, cagra_index, dataset);
   } else if (params.hierarchy == HnswHierarchy::CPU) {
+    RAFT_LOG_INFO("Calling with CPU hierarchy");
     return from_cagra<T, HnswHierarchy::CPU>(res, params, cagra_index, dataset);
   } else if (params.hierarchy == HnswHierarchy::GPU) {
+    RAFT_LOG_INFO("Calling with GPU hierarchy");
     return from_cagra<T, HnswHierarchy::GPU>(res, params, cagra_index, dataset);
   } else {
     RAFT_FAIL("Unsupported hierarchy type");
