@@ -1624,6 +1624,7 @@ void extend(raft::resources const& handle,
           throughput,
           int(ETA / 60),
           std::fmod(ETA, 60.0f));
+      }
     }
   }
 
