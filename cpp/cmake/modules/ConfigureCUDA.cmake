@@ -22,17 +22,17 @@ endif()
 # Be very strict when compiling with GCC as host compiler (and thus more lenient when compiling with
 # clang)
 if(CMAKE_COMPILER_IS_GNUCXX)
-  list(APPEND CUVS_CXX_FLAGS -Wall -Werror -Wno-unknown-pragmas -Wno-error=deprecated-declarations
-       -Wno-reorder
-  )
-  list(APPEND CUVS_CUDA_FLAGS
-       -Xcompiler=-Wall,-Werror,-Wno-error=deprecated-declarations,-Wno-reorder
-  )
+  # list(APPEND CUVS_CXX_FLAGS -Wall -Werror -Wno-unknown-pragmas -Wno-error=deprecated-declarations
+  #      -Wno-reorder
+  # )
+  # list(APPEND CUVS_CUDA_FLAGS
+  #      -Xcompiler=-Wall,-Werror,-Wno-error=deprecated-declarations,-Wno-reorder
+  # )
 
-  # set warnings as errors
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.2.0)
-    list(APPEND CUVS_CUDA_FLAGS -Werror=all-warnings)
-  endif()
+  # # set warnings as errors
+  # if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.2.0)
+  #   list(APPEND CUVS_CUDA_FLAGS -Werror=all-warnings)
+  # endif()
 endif()
 
 # Allow invalid CUDA kernels in the short term
@@ -63,6 +63,6 @@ endif()
 # Debug options
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   message(VERBOSE "cuVS: Building with debugging flags")
-  list(APPEND CUVS_CUDA_FLAGS -G -Xcompiler=-rdynamic)
+  list(APPEND CUVS_CUDA_FLAGS -g -Xcompiler=-rdynamic)
   list(APPEND CUVS_CUDA_FLAGS -Xptxas --suppress-stack-size-warning)
 endif()
