@@ -1580,6 +1580,18 @@ void extend(raft::resources const& handle,
                                     n_clusters,
                                     cudaMemcpyDefault,
                                     stream));
+    {
+      RAFT_LOG_INFO("Saving IVF-PQ cluster centers to clusters.npy");
+      std::ofstream of("clusters.npy", std::ios::out | std::ios::binary);
+      if (!of) { RAFT_FAIL("Cannot open file clusters.npy"); }
+      raft::serialize_mdspan(handle,
+                             of,
+                             raft::make_device_matrix_view<const float, int64_t>(
+                               cluster_centers.data(), n_clusters, index->dim()));
+      of.close();
+      if (!of) { RAFT_FAIL("Error writing clusters.npy"); }
+    }
+
     vec_batches.prefetch_next_batch();
 
     RAFT_LOG_INFO("Assigning vectors to clusters");
@@ -1628,6 +1640,18 @@ void extend(raft::resources const& handle,
     }
   }
 
+  {
+    RAFT_LOG_INFO("Saving IVF-PQ labels to pq_labels.npy");
+    std::ofstream of("pq_labels.npy", std::ios::out | std::ios::binary);
+    if (!of) { RAFT_FAIL("Cannot open file pq_labels.npy"); }
+    raft::serialize_mdspan(
+      handle,
+      of,
+      raft::make_device_vector_view<const uint32_t, int64_t>(new_data_labels.data(), n_rows));
+    of.close();
+    if (!of) { RAFT_FAIL("Error writing pq_labels.npy"); }
+  }
+
   auto list_sizes = index->list_sizes().data_handle();
   // store the current cluster sizes, because we'll need them later
   rmm::device_uvector<uint32_t> orig_list_sizes(n_clusters, stream, device_memory);
@@ -1659,6 +1683,15 @@ void extend(raft::resources const& handle,
   // Update the pointers and the sizes
   ivf::detail::recompute_internal_state(handle, *index);
 
+  RAFT_LOG_INFO("Saving list sizes");
+  {
+    std::ofstream of("cluster_sizes.npy", std::ios::out | std::ios::binary);
+    if (!of) { RAFT_FAIL("Cannot open file cluster_sizes.npy"); }
+    raft::serialize_mdspan(handle, of, index->list_sizes());
+    of.close();
+    if (!of) { RAFT_FAIL("Error writing cluster sizes"); }
+    RAFT_LOG_INFO("cluster_sizes written to disk");
+  }
   // Recover old cluster sizes: they are used as counters in the fill-codes kernel
   raft::copy(list_sizes, orig_list_sizes.data(), n_clusters, stream);
 
