@@ -194,10 +194,32 @@ std::enable_if_t<hierarchy == HnswHierarchy::CPU, std::unique_ptr<index<T>>> fro
     params.ef_construction);
   appr_algo->base_layer_init = false;  // tell hnswlib to build upper layers only
   auto num_threads           = params.num_threads == 0 ? omp_get_max_threads() : params.num_threads;
+  RAFT_LOG_INFO("Adding dataset to HNSW base layer");
+  auto start_clock           = std::chrono::system_clock::now();
+  int64_t next_report_offset = 0;
+  int64_t d_report_offset    = host_dataset_view.extent(0) / 100;  // Report progress in 1% steps.
 #pragma omp parallel for num_threads(num_threads)
   for (int64_t i = 0; i < host_dataset_view.extent(0); i++) {
     appr_algo->addPoint((void*)(host_dataset_view.data_handle() + i * host_dataset_view.extent(1)),
                         i);
+
+    if (i > next_report_offset) {
+      const auto end_clock = std::chrono::system_clock::now();
+
+      next_report_offset += d_report_offset;
+      const auto time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+        1e-6;
+      const auto throughput = i / time;
+      float ETA             = (host_dataset_view.extent(0) - i) / throughput;
+      RAFT_LOG_INFO("# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %d:%3.1f (mm:ss) ETA    \r",
+                    i,
+                    host_dataset_view.extent(0),
+                    i / static_cast<double>(host_dataset_view.extent(0)) * 100,
+                    throughput,
+                    int(ETA / 60),
+                    std::fmod(ETA, 60.0f));
+    }
   }
   appr_algo->base_layer_init = true;  // reset to true to allow addition of new points
 
@@ -216,9 +238,14 @@ std::enable_if_t<hierarchy == HnswHierarchy::CPU, std::unique_ptr<index<T>>> fro
     host_graph_view = host_graph.view();
   }
 
+  RAFT_LOG_INFO("CAdding graph to HNSW base layer");
+  start_clock        = std::chrono::system_clock::now();
+  next_report_offset = 0;
+  d_report_offset    = host_graph_view.extent(0) / 100;  // Report progress in 1% steps.
+
 // copy cagra graph to hnswlib base layer
 #pragma omp parallel for num_threads(num_threads)
-  for (size_t i = 0; i < static_cast<size_t>(host_graph_view.extent(0)); ++i) {
+  for (int64_t i = 0; i < static_cast<int64_t>(host_graph_view.extent(0)); ++i) {
     auto hnsw_internal_id = appr_algo->label_lookup_.find(i)->second;
     auto ll_i             = appr_algo->get_linklist0(hnsw_internal_id);
     appr_algo->setListCount(ll_i, host_graph_view.extent(1));
@@ -226,6 +253,24 @@ std::enable_if_t<hierarchy == HnswHierarchy::CPU, std::unique_ptr<index<T>>> fro
     for (size_t j = 0; j < static_cast<size_t>(host_graph_view.extent(1)); ++j) {
       auto neighbor_internal_id = appr_algo->label_lookup_.find(host_graph(i, j))->second;
       data[j]                   = neighbor_internal_id;
+    }
+
+    if (i > next_report_offset) {
+      const auto end_clock = std::chrono::system_clock::now();
+
+      next_report_offset += d_report_offset;
+      const auto time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+        1e-6;
+      const auto throughput = i / time;
+      float ETA             = (host_graph_view.extent(0) - i) / throughput;
+      RAFT_LOG_INFO("# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %d:%3.1f (mm:ss) ETA    \r",
+                    i,
+                    host_graph_view.extent(0),
+                    i / static_cast<double>(host_graph_view.extent(0)) * 100,
+                    throughput,
+                    int(ETA / 60),
+                    std::fmod(ETA, 60.0f));
     }
   }
 
@@ -327,6 +372,7 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     hnsw_index->get_space(), n_rows, cagra_index.graph().extent(1) / 2, params.ef_construction);
   appr_algo->cur_element_count = n_rows;
 
+  RAFT_LOG_INFO("Assigning points to levels");
   // Initialize linked lists
   auto& levels = appr_algo->element_levels_;
   {
@@ -336,9 +382,9 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
 
     If the dataset is on the device, we want to copy it to HNSW in parallel to the rest of the
     initialization loop. Ideally, we could use cudaMemcpy2DAsync to do this, but this call is very
-    likely to sync with the CPU, because normally the allocated host memory is paged. To avoid this,
-    we use double-buffering and copy data in small batches via pinned memory. Hence, the cuda
-    device-to-host copy is completely overlapped with the host loop.
+    likely to sync with the CPU, because normally the allocated host memory is paged. To avoid
+    this, we use double-buffering and copy data in small batches via pinned memory. Hence, the
+    cuda device-to-host copy is completely overlapped with the host loop.
 
     The batching is completely disabled if the source dataset is on the host.
     */
@@ -396,6 +442,7 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     }
   }
 
+  RAFT_LOG_INFO("Sort points by levels");
   // sort the points by levels
   // build histogram
   std::vector<size_t> hist;
@@ -425,6 +472,7 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
 
   // iterate over the points in the descending order of their levels
   for (size_t pt_level = hist.size() - 1; pt_level >= 1; pt_level--) {
+    RAFT_LOG_INFO("Process level %zu", pt_level);
     common::nvtx::range<common::nvtx::domain::cuvs> level_scope("level %zu", pt_level);
     auto start_idx     = offsets[pt_level - 1];
     auto end_idx       = offsets[hist.size() - 1];
@@ -458,6 +506,11 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
       common::nvtx::range<common::nvtx::domain::cuvs> copy_scope(
         "get_linklist(%zu, %zu)", start_idx, end_idx);
       // add points to the HNSW index upper layers
+      RAFT_LOG_INFO("Adding dataset to HNSW base layer");
+      auto start_clock        = std::chrono::system_clock::now();
+      auto next_report_offset = start_idx;
+      auto d_report_offset    = (end_idx - start_idx) / 100;
+      float n_tmp             = end_idx - start_idx;
 #pragma omp parallel for num_threads(num_threads)
       for (auto i = start_idx; i < end_idx; i++) {
         auto pt_id  = order[i];
@@ -467,6 +520,24 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
         auto neighbors = &host_neighbors(i - start_idx, 0);
         for (auto j = 0; j < host_neighbors.extent(1); j++) {
           data[j] = order[neighbors[j] + start_idx];
+        }
+        if (i > next_report_offset) {
+          const auto end_clock = std::chrono::system_clock::now();
+
+          next_report_offset += d_report_offset;
+          const auto time =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+            1e-6;
+          const auto throughput = i / time;
+          float ETA             = (n_tmp - i) / throughput;
+          RAFT_LOG_INFO(
+            "# Save %12lu / %12lu (%3.2f %%), %e vectors/sec, %d:%3.1f (mm:ss) ETA    \r",
+            i,
+            n_tmp,
+            i / n_tmp * 100,
+            throughput,
+            int(ETA / 60),
+            std::fmod(ETA, 60.0f));
         }
       }
     }
@@ -484,6 +555,10 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
     is_host_accessible = true;
   }
 
+  RAFT_LOG_INFO("Adding graph to HNSW base layer");
+  auto start_clock           = std::chrono::system_clock::now();
+  int64_t next_report_offset = 0;
+  int64_t d_report_offset    = n_rows / 100;  // Report progress in 1% steps.
   // copy cagra graph to hnswlib base layer
   if (is_host_accessible) {
     common::nvtx::range<common::nvtx::domain::cuvs> copy_scope("get_linklist0<host>");
@@ -494,6 +569,23 @@ std::enable_if_t<hierarchy == HnswHierarchy::GPU, std::unique_ptr<index<T>>> fro
       auto* data = (uint32_t*)(ll_i + 1);
       for (int64_t j = 0; j < degree; j++) {
         data[j] = graph_ptr[i * degree + j];
+      }
+      if (i > next_report_offset) {
+        const auto end_clock = std::chrono::system_clock::now();
+
+        next_report_offset += d_report_offset;
+        const auto time =
+          std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+          1e-6;
+        const auto throughput = i / time;
+        float ETA             = (n_rows - i) / throughput;
+        RAFT_LOG_INFO("# Save %12lu / %12lu (%3.2f %%), %e vectors/sec, %d:%3.1f (mm:ss) ETA    \r",
+                      i,
+                      n_rows,
+                      i / static_cast<double>(n_rows) * 100,
+                      throughput,
+                      int(ETA / 60),
+                      std::fmod(ETA, 60.0f));
       }
     }
   } else {

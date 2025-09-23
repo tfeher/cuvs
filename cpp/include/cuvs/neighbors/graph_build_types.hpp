@@ -100,6 +100,10 @@ struct ivf_pq_params {
 
 using nn_descent_params = cuvs::neighbors::nn_descent::index_params;
 
+struct file {
+  int flag;
+};
+
 struct brute_force_params {
   cuvs::neighbors::brute_force::index_params build_params;
   cuvs::neighbors::brute_force::search_params search_params;

@@ -37,6 +37,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <type_traits>
 
 namespace cuvs::neighbors::ivf {
@@ -55,8 +56,31 @@ list<SpecT, SizeT, SpecExtraArgs...>::list(raft::resources const& res,
     capacity = std::min<SizeT>(capacity, spec.align_max);
   }
   try {
-    data    = raft::make_device_mdarray<value_type>(res, spec.make_list_extents(capacity));
+    float GiB        = 1 << 30;
+    size_t mem_free  = 0;
+    size_t mem_total = 0;
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    auto ext = spec.make_list_extents(capacity);
+    std::stringstream ss;
+    size_t n_elements = 1;
+    for (size_t i = 0; i < (size_t)ext.rank() && i < 10; i++) {
+      n_elements *= ext.extent(i);
+      ss << ext.extent(i) << ",";
+    }
+    RAFT_LOG_INFO(
+      "list::list, allocating list with shape [%s], %5.2f GiB  %5.2f GiB, alloc: %5.2fGiB",
+      ss.str().c_str(),
+      n_elements / GiB * sizeof(value_type),
+      mem_free / GiB,
+      (mem_total - mem_free) / GiB);
+    data = raft::make_device_mdarray<value_type>(res, spec.make_list_extents(capacity));
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    RAFT_LOG_INFO("list::list, allocating indices, %5.2f GiB  %5.2f GiB, alloc: %5.2fGiB",
+                  capacity / GiB * sizeof(index_type),
+                  mem_free / GiB,
+                  (mem_total - mem_free) / GiB);
     indices = raft::make_device_vector<index_type, SizeT>(res, capacity);
+    RAFT_LOG_INFO("list allocated");
   } catch (std::bad_alloc& e) {
     RAFT_FAIL(
       "ivf::list: failed to allocate a big enough list to hold all data "

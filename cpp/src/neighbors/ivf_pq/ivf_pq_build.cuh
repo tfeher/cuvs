@@ -67,7 +67,10 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scan.h>
 
+#include <chrono>
+#include <fstream>
 #include <memory>
+#include <raft/core/serialize.hpp>
 #include <variant>
 
 namespace cuvs::neighbors::ivf_pq::detail {
@@ -1081,6 +1084,13 @@ void extend(raft::resources const& handle,
             const IdxT* new_indices,
             IdxT n_rows)
 {
+  float GiB        = 1 << 30;
+  size_t mem_free  = 0;
+  size_t mem_total = 0;
+  RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+  RAFT_LOG_INFO("ivf_pq::extend start, free: %5.2f GiB, alloc: %5.2f GiB",
+                mem_free / GiB,
+                (mem_total - mem_free) / GiB);
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
     "ivf_pq::extend(%zu, %u)", size_t(n_rows), index->dim());
 
@@ -1116,6 +1126,11 @@ void extend(raft::resources const& handle,
     handle,
     list_spec<size_t, IdxT>{spec},
     n_rows + (kIndexGroupSize - 1) * std::min<IdxT>(n_clusters, n_rows));
+
+  RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+  RAFT_LOG_INFO("ivf_pq::extend allocated placeholder list, free: %5.2f GiB, alloc: %5.2f GiB",
+                mem_free / GiB,
+                (mem_total - mem_free) / GiB);
 
   // Available device memory
   size_t free_mem = raft::resource::get_workspace_free_bytes(handle);
@@ -1202,7 +1217,24 @@ void extend(raft::resources const& handle,
                                     n_clusters,
                                     cudaMemcpyDefault,
                                     stream));
+    {
+      RAFT_LOG_INFO("Saving IVF-PQ cluster centers to clusters.npy");
+      std::ofstream of("clusters.npy", std::ios::out | std::ios::binary);
+      if (!of) { RAFT_FAIL("Cannot open file clusters.npy"); }
+      raft::serialize_mdspan(handle,
+                             of,
+                             raft::make_device_matrix_view<const float, int64_t>(
+                               cluster_centers.data(), n_clusters, index->dim()));
+      of.close();
+      if (!of) { RAFT_FAIL("Error writing clusters.npy"); }
+    }
+
     vec_batches.prefetch_next_batch();
+
+    RAFT_LOG_INFO("Assigning vectors to clusters");
+    const auto start_clock    = std::chrono::system_clock::now();
+    size_t d_report_offset    = n_rows / 100;  // Report progress in 1% steps.
+    size_t next_report_offset = d_report_offset;
     for (const auto& batch : vec_batches) {
       auto batch_data_view = raft::make_device_matrix_view<const T, internal_extents_t>(
         batch.data(), batch.size(), index->dim());
@@ -1222,7 +1254,39 @@ void extend(raft::resources const& handle,
       // User needs to make sure kernel finishes its work before we overwrite batch in the next
       // iteration if different streams are used for kernel and copy.
       raft::resource::sync_stream(handle);
+      size_t num_queries_done = batch.offset() + batch.size();
+      const auto end_clock    = std::chrono::system_clock::now();
+      if (batch.offset() > next_report_offset) {
+        next_report_offset += d_report_offset;
+        const auto time =
+          std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+          1e-6;
+        const auto throughput = num_queries_done / time;
+        float ETA             = (n_rows - num_queries_done) / throughput;
+        RAFT_LOG_INFO(
+          "# IVF-PQ assign vectors to clusters: %12lu / %12lu (%3.2f %%), %e vec/sec, %d:%3.1f "
+          "minutes "
+          "ETA\r",
+          num_queries_done,
+          n_rows,
+          num_queries_done / static_cast<double>(n_rows) * 100,
+          throughput,
+          int(ETA / 60),
+          std::fmod(ETA, 60.0f));
+      }
     }
+  }
+
+  {
+    RAFT_LOG_INFO("Saving IVF-PQ labels to pq_labels.npy");
+    std::ofstream of("pq_labels.npy", std::ios::out | std::ios::binary);
+    if (!of) { RAFT_FAIL("Cannot open file pq_labels.npy"); }
+    raft::serialize_mdspan(
+      handle,
+      of,
+      raft::make_device_vector_view<const uint32_t, int64_t>(new_data_labels.data(), n_rows));
+    of.close();
+    if (!of) { RAFT_FAIL("Error writing pq_labels.npy"); }
   }
 
   auto list_sizes = index->list_sizes().data_handle();
@@ -1256,6 +1320,15 @@ void extend(raft::resources const& handle,
   // Update the pointers and the sizes
   ivf::detail::recompute_internal_state(handle, *index);
 
+  RAFT_LOG_INFO("Saving list sizes");
+  {
+    std::ofstream of("cluster_sizes.npy", std::ios::out | std::ios::binary);
+    if (!of) { RAFT_FAIL("Cannot open file cluster_sizes.npy"); }
+    raft::serialize_mdspan(handle, of, index->list_sizes());
+    of.close();
+    if (!of) { RAFT_FAIL("Error writing cluster sizes"); }
+    RAFT_LOG_INFO("cluster_sizes written to disk");
+  }
   // Recover old cluster sizes: they are used as counters in the fill-codes kernel
   raft::copy(list_sizes, orig_list_sizes.data(), n_clusters, stream);
 
@@ -1265,6 +1338,10 @@ void extend(raft::resources const& handle,
     new_indices, n_rows, 1, max_batch_size, stream, batches_mr);
   vec_batches.reset();
   vec_batches.prefetch_next_batch();
+  const auto start_clock    = std::chrono::system_clock::now();
+  size_t d_report_offset    = n_rows / 100;  // Report progress in 1% steps.
+  size_t next_report_offset = d_report_offset;
+
   for (const auto& vec_batch : vec_batches) {
     const auto& idx_batch = *idx_batches++;
     if (index->metric() == CosineExpanded) {
@@ -1286,6 +1363,24 @@ void extend(raft::resources const& handle,
     // User needs to make sure kernel finishes its work before we overwrite batch in the next
     // iteration if different streams are used for kernel and copy.
     raft::resource::sync_stream(handle);
+    size_t num_queries_done = vec_batch.offset() + vec_batch.size();
+    const auto end_clock    = std::chrono::system_clock::now();
+    if (vec_batch.offset() > next_report_offset) {
+      next_report_offset += d_report_offset;
+      const auto time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
+        1e-6;
+      const auto throughput = num_queries_done / time;
+      float ETA             = (n_rows - num_queries_done) / throughput;
+      RAFT_LOG_INFO(
+        "# IVF-PQ encode vectors: %12lu / %12lu (%3.2f %%), %e vecs/sec, %d:%3.1f minutes ETA\r",
+        num_queries_done,
+        n_rows,
+        num_queries_done / static_cast<double>(n_rows) * 100,
+        throughput,
+        int(ETA / 60),
+        std::fmod(ETA, 60.0f));
+    }
   }
 }
 
@@ -1311,6 +1406,13 @@ auto build(raft::resources const& handle,
            raft::mdspan<const T, raft::matrix_extent<IdxT>, raft::row_major, accessor> dataset)
   -> index<IdxT>
 {
+  float GiB        = 1 << 30;
+  size_t mem_free  = 0;
+  size_t mem_total = 0;
+  RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+  RAFT_LOG_INFO("ivf_pq::build start, free: %5.2f GiB, alloc: %5.2f GiB",
+                mem_free / GiB,
+                (mem_total - mem_free) / GiB);
   IdxT n_rows = dataset.extent(0);
   IdxT dim    = dataset.extent(1);
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
@@ -1338,6 +1440,10 @@ auto build(raft::resources const& handle,
   utils::memzero(index.data_ptrs().data_handle(), index.data_ptrs().size(), stream);
   utils::memzero(index.inds_ptrs().data_handle(), index.inds_ptrs().size(), stream);
 
+  RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+  RAFT_LOG_INFO("ivf_pq::build index struct initialized, free: %5.2f GiB, alloc: %5.2f GiB",
+                mem_free / GiB,
+                (mem_total - mem_free) / GiB);
   {
     raft::random::RngState random_state{137};
     auto trainset_ratio = std::max<size_t>(
@@ -1361,6 +1467,7 @@ auto build(raft::resources const& handle,
     // to use gemm operations from cublas.
     auto trainset = raft::make_device_mdarray<float>(
       handle, big_memory_resource, raft::make_extents<int64_t>(0, 0));
+
     try {
       trainset = raft::make_device_mdarray<float>(
         handle, big_memory_resource, raft::make_extents<int64_t>(n_rows_train, dim));
@@ -1370,6 +1477,11 @@ auto build(raft::resources const& handle,
         "kmeans_trainset_fraction, or set large_workspace_resource appropriately.");
       throw;
     }
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    RAFT_LOG_INFO("ivf_pq::build trainset created, size: %5.2f, free: %5.2f GiB, alloc: %5.2f GiB",
+                  trainset.size() * sizeof(float) / GiB,
+                  mem_free / GiB,
+                  (mem_total - mem_free) / GiB);
     // TODO: a proper sampling
     if constexpr (std::is_same_v<T, float>) {
       raft::matrix::sample_rows<T, int64_t>(handle, random_state, dataset, trainset.view());
@@ -1383,9 +1495,19 @@ auto build(raft::resources const& handle,
       // TODO(tfeher): Enable codebook generation with any type T, and then remove trainset tmp.
       auto trainset_tmp = raft::make_device_mdarray<T>(
         handle, big_memory_resource, raft::make_extents<int64_t>(n_rows_train, dim));
+      RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+      RAFT_LOG_INFO(
+        "ivf_pq::build int trainset created, size: %5.2f, free: %5.2f GiB, alloc: %5.2f GiB",
+        trainset.size() * sizeof(T) / GiB,
+        mem_free / GiB,
+        (mem_total - mem_free) / GiB);
 
       raft::matrix::sample_rows<T, int64_t>(handle, random_state, dataset, trainset_tmp.view());
 
+      RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+      RAFT_LOG_INFO("ivf_pq::build rows sampled initialized, free: %5.2f GiB, alloc: %5.2f GiB",
+                    mem_free / GiB,
+                    (mem_total - mem_free) / GiB);
       raft::linalg::unaryOp(trainset.data_handle(),
                             trainset_tmp.data_handle(),
                             trainset.size(),
@@ -1393,6 +1515,10 @@ auto build(raft::resources const& handle,
                             raft::resource::get_cuda_stream(handle));
     }
 
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    RAFT_LOG_INFO("ivf_pq::build int train set deallocated, free: %5.2f GiB, alloc: %5.2f GiB",
+                  mem_free / GiB,
+                  (mem_total - mem_free) / GiB);
     // NB: here cluster_centers is used as if it is [n_clusters, data_dim] not [n_clusters,
     // dim_ext]!
     rmm::device_uvector<float> cluster_centers_buf(
@@ -1411,6 +1537,10 @@ auto build(raft::resources const& handle,
       raft::linalg::row_normalize<raft::linalg::L2Norm>(
         handle, trainset_const_view, trainset.view());
     }
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    RAFT_LOG_INFO("ivf_pq::build calling kmeans_fit, free: %5.2f GiB, alloc: %5.2f GiB",
+                  mem_free / GiB,
+                  (mem_total - mem_free) / GiB);
     cuvs::cluster::kmeans_balanced::fit(
       handle, kmeans_params, trainset_const_view, centers_view, utils::mapping<float>{});
 
@@ -1435,6 +1565,10 @@ auto build(raft::resources const& handle,
 
     helpers::set_centers(handle, &index, raft::make_const_mdspan(centers_view));
 
+    RAFT_CUDA_TRY_NO_THROW(cudaMemGetInfo(&mem_free, &mem_total));
+    RAFT_LOG_INFO("ivf_pq::build training codebooks, free: %5.2f GiB, alloc: %5.2f GiB",
+                  mem_free / GiB,
+                  (mem_total - mem_free) / GiB);
     // Train PQ codebooks
     switch (index.codebook_kind()) {
       case codebook_gen::PER_SUBSPACE:

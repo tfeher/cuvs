@@ -119,8 +119,13 @@ void cuvs_cagra_hnswlib<T, IdxT>::build(const T* dataset, size_t nrow)
   }
 
   // convert the index to HNSW format
+  const auto start_clock = std::chrono::system_clock::now();
   hnsw_index_ = cuvs::neighbors::hnsw::from_cagra(
     handle_, build_param_.hnsw_index_params, cagra_index, opt_dataset_view);
+int time =
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start_clock)
+      .count();
+  RAFT_LOG_INFO("Graph saved to HNSW format in %d:%d min", time / 60, time % 60);
 }
 
 template <typename T, typename IdxT>

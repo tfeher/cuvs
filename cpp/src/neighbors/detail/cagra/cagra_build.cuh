@@ -19,7 +19,9 @@
 #include "../../vpq_dataset.cuh"
 #include "graph_core.cuh"
 #include <cuvs/neighbors/cagra.hpp>
+#include <fstream>
 
+#include <raft/core/detail/mdspan_numpy_serializer.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
@@ -28,6 +30,7 @@
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/logger.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/serialize.hpp>
 
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/ivf_pq.hpp>
@@ -41,7 +44,10 @@
 #include <rmm/resource_ref.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <type_traits>
 #include <vector>
 
@@ -154,7 +160,8 @@ void build_knn_graph(
     return std::string(model_name);
   }();
 
-  RAFT_LOG_DEBUG("# Building IVF-PQ index %s", model_name.c_str());
+  raft::resource::set_workspace_to_pool_resource(res, 512 * 1024 * 1024ull);
+  RAFT_LOG_INFO("# Building IVF-PQ index %s", model_name.c_str());
   auto index = cuvs::neighbors::ivf_pq::build(res, pq.build_params, dataset);
 
   //
@@ -213,7 +220,7 @@ void build_knn_graph(
     use_large_workspace ? raft::resource::get_large_workspace_resource(res)
                         : raft::resource::get_workspace_resource(res);
 
-  RAFT_LOG_DEBUG(
+  RAFT_LOG_INFO(
     "IVF-PQ search node_degree: %d, top_k: %d,  gpu_top_k: %d,  max_batch_size:: %d, n_probes: %u",
     node_degree,
     top_k,
@@ -358,21 +365,22 @@ void build_knn_graph(
         std::chrono::duration_cast<std::chrono::microseconds>(end_clock - start_clock).count() *
         1e-6;
       const auto throughput = num_queries_done / time;
-
-      RAFT_LOG_DEBUG(
-        "# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %.2f minutes ETA, self included = "
+      float ETA             = (num_queries - num_queries_done) / throughput;
+      RAFT_LOG_INFO(
+        "# Search %12lu / %12lu (%3.2f %%), %e queries/sec, %d:%3.1f (mm:ss) ETA, self included = "
         "%3.2f %%    \r",
         num_queries_done,
         dataset.extent(0),
         num_queries_done / static_cast<double>(dataset.extent(0)) * 100,
         throughput,
-        (num_queries - num_queries_done) / throughput / 60,
+        int(ETA / 60),
+        std::fmod(ETA, 60.0f),
         static_cast<double>(num_self_included) / num_queries_done * 100.);
     }
     first = false;
   }
 
-  if (!first) RAFT_LOG_DEBUG("# Finished building kNN graph");
+  if (!first) RAFT_LOG_INFO("# Finished building kNN graph");
   if (static_cast<double>(num_self_included) / dataset.extent(0) * 100. < 5) {
     RAFT_LOG_WARN(
       "Self-included ratio is low: %2.2f %%. This can lead to poor recall. "
@@ -656,6 +664,88 @@ auto iterative_build_graph(
   return cagra_graph;
 }
 
+template <typename T, typename idx_t>
+raft::host_matrix_view<T, idx_t> make_mmap_matrix(const std::string& filename, size_t m, size_t n)
+{
+  const auto dtype   = raft::detail::numpy_serializer::get_numpy_dtype<T>();
+  bool fortran_order = false;
+  using raft::detail::numpy_serializer::ndarray_len_t;
+  std::vector<ndarray_len_t> shape{static_cast<ndarray_len_t>(m), static_cast<ndarray_len_t>(n)};
+  raft::detail::numpy_serializer::header_t header = {dtype, fortran_order, shape};
+  std::stringstream ss;
+  raft::detail::numpy_serializer::write_header(ss, header);
+  size_t header_size = ss.str().size();
+
+  int fd = open(filename.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+  if (fd == -1) { THROW("Error creating file"); }
+  size_t num_elements = m * n;
+  std::cout << "Array shape [" << m << ", " << n << "], num_elements" << num_elements << std::endl;
+  size_t file_size   = num_elements * sizeof(T) + header_size;
+  float file_size_gb = file_size / 1e9;
+  RAFT_LOG_INFO("Creating file %s, size %.2f GB", filename.c_str(), file_size_gb);
+
+  if (posix_fallocate(fd, 0, file_size)) {
+    close(fd);
+    THROW("Error resizing file");
+  }
+  auto bytes_written = write(fd, ss.str().c_str(), ss.str().size());
+  if (static_cast<size_t>(bytes_written) != header_size) {
+    std::cerr << "Error writing the header" << std::endl;
+  }
+  void* data = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (data == MAP_FAILED) { THROW("mmap error"); }
+  if (madvise(data, file_size, MADV_HUGEPAGE) != 0) {
+    munmap(data, file_size);
+    data = nullptr;
+    THROW("madvise error");
+  }
+
+  auto dataset =
+    raft::make_host_matrix_view<T, idx_t>(reinterpret_cast<T*>((char*)data + header_size), m, n);
+
+  return dataset;
+}
+
+template <typename T, typename idx_t>
+raft::host_matrix_view<T, idx_t> mmap_matrix(const std::string& filename)
+{
+  size_t n_rows      = 0;
+  size_t n_cols      = 0;
+  size_t header_size = 0;
+  {
+    std::ifstream is(filename, std::ios::in | std::ios::binary);
+    raft::detail::numpy_serializer::header_t header =
+      raft::detail::numpy_serializer::read_header(is);
+    n_rows = header.shape[0];
+    n_cols = header.shape[1];
+    std::stringstream ss;
+    raft::detail::numpy_serializer::write_header(ss, header);
+    header_size = ss.str().size();
+  }
+  int fd = open(filename.c_str(), O_RDONLY);
+  if (fd == -1) { THROW("Error opening file"); }
+  size_t num_elements = n_rows * n_cols;
+  std::cout << "mmap Array shape [" << n_rows << ", " << n_cols << "], num_elements" << num_elements
+            << std::endl;
+  size_t file_size   = num_elements * sizeof(T) + header_size;
+  float file_size_gb = file_size / 1e9;
+  RAFT_LOG_INFO("mmap file %s, size %.2f GB", filename.c_str(), file_size_gb);
+
+  void* data = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);
+  if (data == MAP_FAILED) { THROW("mmap error"); }
+  if (madvise(data, file_size, MADV_HUGEPAGE) != 0) {
+    munmap(data, file_size);
+    data = nullptr;
+    THROW("madvise error");
+  }
+
+  auto dataset = raft::make_host_matrix_view<T, idx_t>(
+    reinterpret_cast<T*>((char*)data + header_size), n_rows, n_cols);
+
+  return dataset;
+}
 template <typename T,
           typename IdxT     = uint32_t,
           typename Accessor = raft::host_device_accessor<std::experimental::default_accessor<T>,
@@ -691,99 +781,152 @@ index<T, IdxT> build(
 
   // Set default value in case knn_build_params is not defined.
   auto knn_build_params = params.graph_build_params;
-  if (std::holds_alternative<std::monostate>(params.graph_build_params)) {
-    // Heuristic to decide default build algo and its params.
-    if (cuvs::neighbors::nn_descent::has_enough_device_memory(
-          res, dataset.extents(), sizeof(IdxT))) {
-      RAFT_LOG_DEBUG("NN descent solver");
-      knn_build_params =
-        cagra::graph_build_params::nn_descent_params(intermediate_degree, params.metric);
-    } else {
-      RAFT_LOG_DEBUG("Selecting IVF-PQ solver");
-      knn_build_params = cagra::graph_build_params::ivf_pq_params(dataset.extents(), params.metric);
-    }
-  }
-  RAFT_EXPECTS(
-    params.metric != BitwiseHamming ||
-      std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
-        knn_build_params) ||
-      std::holds_alternative<cagra::graph_build_params::nn_descent_params>(knn_build_params),
-    "IVF_PQ for CAGRA graph build does not support BitwiseHamming as a metric. Please "
-    "use nn-descent or the iterative CAGRA search build.");
 
-  // Validate data type for BitwiseHamming metric
-  RAFT_EXPECTS(params.metric != cuvs::distance::DistanceType::BitwiseHamming ||
-                 (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>),
-               "BitwiseHamming distance is only supported for int8_t and uint8_t data types. "
-               "Current data type is not supported.");
+  const char* env_var_override = std::getenv("CAGRA_GRAPH");
+  auto cagra_graph             = raft::make_host_matrix<IdxT, int64_t>(0, 0);
+  auto cagra_graph_view        = raft::make_host_matrix_view<IdxT, int64_t>(nullptr, 0, 0);
+  if (env_var_override != nullptr) {
+    std::string filename(env_var_override);
+    // std::ifstream is(filename, std::ios::in | std::ios::binary);
+    // raft::detail::numpy_serializer::header_t header =
+    //   raft::detail::numpy_serializer::read_header(is);
+    // is.seekg(0);  // rewind
+    // RAFT_LOG_INFO("Creating  CAGRA to read it from file");
 
-  auto cagra_graph = raft::make_host_matrix<IdxT, int64_t>(0, 0);
-
-  // Dispatch based on graph_build_params
-  if (std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
-        knn_build_params)) {
-    cagra_graph = iterative_build_graph<T, IdxT, Accessor>(res, params, dataset);
+    // cagra_graph = raft::make_host_matrix<IdxT, int64_t>(header.shape[0], header.shape[1]);
+    // raft::deserialize_mdspan(res, is, cagra_graph.view());
+    cagra_graph_view = mmap_matrix<IdxT, int64_t>(filename);
+    RAFT_LOG_INFO("Read CAGRA graph from file %s, shape %dx%d",
+                  filename.c_str(),
+                  static_cast<int>(cagra_graph_view.extent(0)),
+                  static_cast<int>(cagra_graph_view.extent(1)));
+    // is.close();
   } else {
-    std::optional<raft::host_matrix<IdxT, int64_t>> knn_graph(
-      raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), intermediate_degree));
-
-    if (std::holds_alternative<cagra::graph_build_params::ivf_pq_params>(knn_build_params)) {
-      auto ivf_pq_params =
-        std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(knn_build_params);
-      if (ivf_pq_params.build_params.metric != params.metric) {
-        RAFT_LOG_WARN(
-          "Metric (%lu) for IVF-PQ needs to match cagra metric (%lu), "
-          "aligning IVF-PQ metric.",
-          ivf_pq_params.build_params.metric,
-          params.metric);
-        ivf_pq_params.build_params.metric = params.metric;
-      }
-      build_knn_graph(res, dataset, knn_graph->view(), ivf_pq_params);
-    } else {
-      auto nn_descent_params =
-        std::get<cagra::graph_build_params::nn_descent_params>(knn_build_params);
-
-      if (nn_descent_params.metric != params.metric) {
-        RAFT_LOG_WARN(
-          "Metric (%lu) for nn-descent needs to match cagra metric (%lu), "
-          "aligning nn-descent metric.",
-          nn_descent_params.metric,
-          params.metric);
-        nn_descent_params.metric = params.metric;
-      }
-      if (nn_descent_params.graph_degree != intermediate_degree) {
-        RAFT_LOG_WARN(
-          "Graph degree (%lu) for nn-descent needs to match cagra intermediate graph degree (%lu), "
-          "aligning "
-          "nn-descent graph_degree.",
-          nn_descent_params.graph_degree,
-          intermediate_degree);
-        nn_descent_params =
+    if (std::holds_alternative<std::monostate>(params.graph_build_params)) {
+      // Heuristic to decide default build algo and its params.
+      if (cuvs::neighbors::nn_descent::has_enough_device_memory(
+            res, dataset.extents(), sizeof(IdxT))) {
+        RAFT_LOG_INFO("NN descent solver");
+        knn_build_params =
           cagra::graph_build_params::nn_descent_params(intermediate_degree, params.metric);
+      } else {
+        RAFT_LOG_DEBUG("Selecting IVF-PQ solver");
+        knn_build_params =
+          cagra::graph_build_params::ivf_pq_params(dataset.extents(), params.metric);
+      }
+    }
+    RAFT_EXPECTS(
+      params.metric != BitwiseHamming ||
+        std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
+          knn_build_params) ||
+        std::holds_alternative<cagra::graph_build_params::nn_descent_params>(knn_build_params),
+      "IVF_PQ for CAGRA graph build does not support BitwiseHamming as a metric. Please "
+      "use nn-descent or the iterative CAGRA search build.");
+
+    // Validate data type for BitwiseHamming metric
+    RAFT_EXPECTS(params.metric != cuvs::distance::DistanceType::BitwiseHamming ||
+                   (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>),
+                 "BitwiseHamming distance is only supported for int8_t and uint8_t data types. "
+                 "Current data type is not supported.");
+
+    // Dispatch based on graph_build_params
+    if (std::holds_alternative<cagra::graph_build_params::iterative_search_params>(
+          knn_build_params)) {
+      cagra_graph = iterative_build_graph<T, IdxT, Accessor>(res, params, dataset);
+    } else {
+      RAFT_LOG_INFO("Allocating KNN graph");
+
+      auto knn_graph = make_mmap_matrix<IdxT, int64_t>(
+        "/tmp/knn_graph.npy", dataset.extent(0), intermediate_degree);
+      // raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), intermediate_degree));
+
+      if (std::holds_alternative<cagra::graph_build_params::ivf_pq_params>(knn_build_params)) {
+        auto ivf_pq_params =
+          std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(knn_build_params);
+        if (ivf_pq_params.build_params.metric != params.metric) {
+          RAFT_LOG_WARN(
+            "Metric (%lu) for IVF-PQ needs to match cagra metric (%lu), "
+            "aligning IVF-PQ metric.",
+            ivf_pq_params.build_params.metric,
+            params.metric);
+          ivf_pq_params.build_params.metric = params.metric;
+        }
+        auto start_clock = std::chrono::system_clock::now();
+        build_knn_graph(res, dataset, knn_graph, ivf_pq_params);
+        int time = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now() - start_clock)
+                     .count();
+
+        RAFT_LOG_INFO("KNN Graph built in %d:%d (mm:ss)", time / 60, time % 60);
+
+      } else {
+        auto nn_descent_params =
+          std::get<cagra::graph_build_params::nn_descent_params>(knn_build_params);
+
+        if (nn_descent_params.metric != params.metric) {
+          RAFT_LOG_WARN(
+            "Metric (%lu) for nn-descent needs to match cagra metric (%lu), "
+            "aligning nn-descent metric.",
+            nn_descent_params.metric,
+            params.metric);
+          nn_descent_params.metric = params.metric;
+        }
+        if (nn_descent_params.graph_degree != intermediate_degree) {
+          RAFT_LOG_WARN(
+            "Graph degree (%lu) for nn-descent needs to match cagra intermediate graph degree "
+            "(%lu), "
+            "aligning "
+            "nn-descent graph_degree.",
+            nn_descent_params.graph_degree,
+            intermediate_degree);
+          nn_descent_params =
+            cagra::graph_build_params::nn_descent_params(intermediate_degree, params.metric);
+        }
+
+        // Use nn-descent to build CAGRA knn graph
+        nn_descent_params.return_distances = false;
+        build_knn_graph<T, IdxT>(res, dataset, knn_graph, nn_descent_params);
       }
 
-      // Use nn-descent to build CAGRA knn graph
-      nn_descent_params.return_distances = false;
-      build_knn_graph<T, IdxT>(res, dataset, knn_graph->view(), nn_descent_params);
+      float GiB   = 1 << 30;
+      float hsize = knn_graph.size() * sizeof(IdxT) / GiB;
+      RAFT_LOG_INFO("KNN graph built, size %f GiB", hsize);
+
+      // std::ofstream of("/tmp/knn_graph.npy", std::ios::out | std::ios::binary);
+      // if (!of) { RAFT_FAIL("Cannot open file /tmp/knn_graph.npy"); }
+
+      // raft::serialize_mdspan(res, of, knn_graph->view());
+      // of.close();
+      // if (!of) { RAFT_FAIL("Error writing knn graph"); }
+      // RAFT_LOG_INFO("KNN graph written to disk");
+
+      cagra_graph = raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), graph_degree);
+      hsize       = cagra_graph.size() * sizeof(typename decltype(cagra_graph)::element_type) / GiB;
+      RAFT_LOG_INFO("CAGRA graph size %f GiB", hsize);
+      RAFT_LOG_INFO("optimizing graph");
+
+      const auto start_clock = std::chrono::system_clock::now();
+
+      optimize<IdxT>(res, knn_graph, cagra_graph.view(), params.guarantee_connectivity);
+      int time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() -
+                                                                  start_clock)
+                   .count();
+      // free intermediate graph before trying to create the index
+      // knn_graph.reset();
+      RAFT_LOG_INFO("Graph optimized in %d:%d seconds, creating index", time / 60, time % 60);
     }
-
-    cagra_graph = raft::make_host_matrix<IdxT, int64_t>(dataset.extent(0), graph_degree);
-
-    RAFT_LOG_TRACE("optimizing graph");
-    optimize<IdxT>(res, knn_graph->view(), cagra_graph.view(), params.guarantee_connectivity);
-
-    // free intermediate graph before trying to create the index
-    knn_graph.reset();
   }
-
-  RAFT_LOG_TRACE("Graph optimized, creating index");
 
   // Construct an index from dataset and optimized knn graph.
   if (params.compression.has_value()) {
     RAFT_EXPECTS(params.metric == cuvs::distance::DistanceType::L2Expanded,
                  "VPQ compression is only supported with L2Expanded distance mertric");
     index<T, IdxT> idx(res, params.metric);
-    idx.update_graph(res, raft::make_const_mdspan(cagra_graph.view()));
+    if (cagra_graph_view.size() > 0) {
+      idx.update_graph(res, raft::make_const_mdspan(cagra_graph_view));
+    } else {
+      idx.update_graph(res, raft::make_const_mdspan(cagra_graph.view()));
+    }
     idx.update_dataset(
       res,
       // TODO: hardcoding codebook math to `half`, we can do runtime dispatching later
@@ -810,7 +953,7 @@ index<T, IdxT> build(
     }
   }
   index<T, IdxT> idx(res, params.metric);
-  idx.update_graph(res, raft::make_const_mdspan(cagra_graph.view()));
+  idx.move_graph(res, std::move(cagra_graph));
   return idx;
 }
 }  // namespace cuvs::neighbors::cagra::detail
