@@ -7,7 +7,7 @@
 
 #include "../../core/nvtx.hpp"
 #include "../../core/omp_wrapper.hpp"
-#include "../../util/file_io.hpp"
+#include <cuvs/util/file_io.hpp>
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>

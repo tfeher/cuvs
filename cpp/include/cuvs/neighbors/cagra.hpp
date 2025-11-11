@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "../../../src/util/file_io.hpp"
+#include <cuvs/util/file_io.hpp>
 
 #include "common.hpp"
 #include <cuvs/distance/distance.hpp>

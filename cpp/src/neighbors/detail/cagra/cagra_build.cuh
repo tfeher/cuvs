@@ -5,7 +5,7 @@
 #pragma once
 
 #include "../../../core/nvtx.hpp"
-#include "../../../util/file_io.hpp"
+#include <cuvs/util/file_io.hpp>
 #include "../../../util/host_memory.hpp"
 #include "../../vpq_dataset.cuh"
 #include "graph_core.cuh"

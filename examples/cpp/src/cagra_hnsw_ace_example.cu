@@ -19,7 +19,14 @@
 
 #include "common.cuh"
 
-void cagra_build_search_ace(raft::device_resources const& dev_resources,
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib> // for exit
+
+int cagra_build_search_ace(raft::device_resources const& dev_resources,
                             raft::device_matrix_view<const float, int64_t> dataset,
                             raft::device_matrix_view<const float, int64_t> queries)
 {
@@ -51,22 +58,44 @@ void cagra_build_search_ace(raft::device_resources const& dev_resources,
   ace_params.ef_construction = 120;
   // Set the directory to store the ACE build artifacts. This should be the fastest disk in the
   // system and hold enough space for twice the dataset, final graph, and label mapping.
-  ace_params.build_dir = "/tmp/ace_build";
+  ace_params.build_dir = "/tmp/tfeher/ace_build";
   // Set whether to use disk-based storage for ACE build. When true, enables disk-based operations
   // for memory-efficient graph construction. If not set, the index will be built in memory if the
   // graph fits in host and GPU memory, and on disk otherwise.
-  // ace_params.use_disk  = true;
+  ace_params.use_disk  = true;
   index_params.graph_build_params = ace_params;
 
-  // ACE requires the dataset to be on the host
-  auto dataset_host = raft::make_host_matrix<float, int64_t>(dataset.extent(0), dataset.extent(1));
-  raft::copy(dataset_host.data_handle(),
-             dataset.data_handle(),
-             dataset.extent(0) * dataset.extent(1),
-             raft::resource::get_cuda_stream(dev_resources));
-  raft::resource::sync_stream(dev_resources);
-  auto dataset_host_view = raft::make_host_matrix_view<const float, int64_t, raft::row_major>(
-    dataset_host.data_handle(), dataset_host.extent(0), dataset_host.extent(1));
+  int fd = open("openai_5M/base.5M.fbin", O_RDONLY);
+   if (fd == -1) {
+        perror("Error opening file");
+        return EXIT_FAILURE;
+    }
+  uint32_t shape[2];
+  ssize_t bytesRead = read(fd, shape, 8);
+  if (bytesRead != 8) {
+        perror("Error reading shape");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+  size_t data_size = shape[0] * static_cast<size_t>(shape[1]);
+  std::cout<< "Dataset size " << data_size << std::endl;
+  size_t header_size = sizeof(shape);
+  size_t file_size = data_size * sizeof(float) + header_size;
+  float *dataset_ptr = (float*) mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+  std::cout << "shape [" << shape[0] <<", " << shape[1]<<"]"<<std::endl;
+  if (dataset_ptr == MAP_FAILED) {
+        perror("Error mmapping the file");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+  auto dataset_host_view = raft::make_host_matrix_view<const float, int64_t, raft::row_major>(dataset_ptr + header_size, shape[0], shape[1]);
+
+  // float sum = 0;
+  // for (size_t i = 0; i < dataset_host_view.size(); i++) {
+  //   if (i%(1536*10000)==0) std::cout<<i/(1536) << std::endl;
+  //   sum += *(dataset_host_view.data_handle() + i);
+  // }
+  // std::cout << "Sum " << sum << std::endl;
 
   std::cout << "Building CAGRA index (search graph)" << std::endl;
   auto index = cagra::build(dev_resources, index_params, dataset_host_view);
@@ -151,6 +180,7 @@ void cagra_build_search_ace(raft::device_resources const& dev_resources,
   raft::resource::sync_stream(dev_resources);
 
   print_results(dev_resources, neighbors.view(), distances.view());
+  return 0;
 }
 
 int main()
@@ -169,8 +199,8 @@ int main()
   // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
 
   // Create input arrays.
-  int64_t n_samples = 10000;
-  int64_t n_dim     = 90;
+  int64_t n_samples = 1000;
+  int64_t n_dim     = 1536;
   int64_t n_queries = 10;
   auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
   auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
