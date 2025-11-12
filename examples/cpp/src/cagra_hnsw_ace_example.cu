@@ -52,7 +52,7 @@ int cagra_build_search_ace(raft::device_resources const& dev_resources,
   // available host and GPU memory. The partition size is on average 2 * (n_rows / npartitions) *
   // dim * sizeof(T). 2 is because of the core and augmented vectors. Please account for imbalance
   // in the partition sizes (up to 3x in our tests).
-  ace_params.npartitions = 4;
+  ace_params.npartitions = 10;
   // Set the index quality for the ACE build. Bigger values increase the index quality. At some
   // point, increasing this will no longer improve the quality.
   ace_params.ef_construction = 120;
