@@ -105,7 +105,6 @@ int cagra_build_search_ace(raft::device_resources const& dev_resources)
   // For disk-based indices, the HNSW index file path can be obtained via file_path()
   std::string hnsw_index_path = hnsw_index->file_path();
   std::cout << "HNSW index file location: " << hnsw_index_path << std::endl;
-  std::cout << "Deserializing HNSW index from disk for search." << std::endl;
 
   munmap(dataset_ptr, file_size);
   close(fd);
