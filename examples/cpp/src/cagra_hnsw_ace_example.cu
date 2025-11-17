@@ -26,18 +26,11 @@
 #include <cstdio>
 #include <cstdlib> // for exit
 
-int cagra_build_search_ace(raft::device_resources const& dev_resources,
-                            raft::device_matrix_view<const float, int64_t> dataset,
-                            raft::device_matrix_view<const float, int64_t> queries)
+int cagra_build_search_ace(raft::device_resources const& dev_resources)
 {
   using namespace cuvs::neighbors;
 
   int64_t topk      = 12;
-  int64_t n_queries = queries.extent(0);
-
-  // create output arrays
-  auto neighbors = raft::make_device_matrix<uint32_t>(dev_resources, n_queries, topk);
-  auto distances = raft::make_device_matrix<float>(dev_resources, n_queries, topk);
 
   // CAGRA index parameters
   cagra::index_params index_params;
@@ -88,8 +81,10 @@ int cagra_build_search_ace(raft::device_resources const& dev_resources,
         perror("Error mmapping the file");
         close(fd);
         return EXIT_FAILURE;
-    }
-  auto dataset_host_view = raft::make_host_matrix_view<const float, int64_t, raft::row_major>(dataset_ptr + header_size, shape[0], shape[1]);
+   } 
+  uint32_t n_rows = shape[0];
+  //n_rows = 1000000;
+  auto dataset_host_view = raft::make_host_matrix_view<const float, int64_t, raft::row_major>(dataset_ptr + header_size, n_rows, shape[1]);
 
   std::cout << "Building CAGRA index (search graph)" << std::endl;
   auto index = cagra::build(dev_resources, index_params, dataset_host_view);
@@ -105,62 +100,15 @@ int cagra_build_search_ace(raft::device_resources const& dev_resources,
   std::cout << "Converting CAGRA index to HNSW" << std::endl;
   hnsw::index_params hnsw_params;
   auto hnsw_index = hnsw::from_cagra(dev_resources, hnsw_params, index);
-
-  // HNSW search requires host matrices
-  auto queries_host = raft::make_host_matrix<float, int64_t>(n_queries, queries.extent(1));
-  raft::copy(queries_host.data_handle(),
-             queries.data_handle(),
-             n_queries * queries.extent(1),
-             raft::resource::get_cuda_stream(dev_resources));
-  raft::resource::sync_stream(dev_resources);
-
-  // HNSW search outputs uint64_t indices
-  auto indices_hnsw_host   = raft::make_host_matrix<uint64_t, int64_t>(n_queries, topk);
-  auto distances_hnsw_host = raft::make_host_matrix<float, int64_t>(n_queries, topk);
-
-  hnsw::search_params hnsw_search_params;
-  hnsw_search_params.ef          = std::max(200, static_cast<int>(topk) * 2);
-  hnsw_search_params.num_threads = 1;
+  //hnsw::serialize(dev_resources, "hnsw_index.bin", *hnsw_index);
 
   // For disk-based indices, the HNSW index file path can be obtained via file_path()
   std::string hnsw_index_path = hnsw_index->file_path();
   std::cout << "HNSW index file location: " << hnsw_index_path << std::endl;
   std::cout << "Deserializing HNSW index from disk for search." << std::endl;
 
-  hnsw::index<float>* hnsw_index_raw = nullptr;
-  hnsw::deserialize(
-    dev_resources, hnsw_params, hnsw_index_path, index.dim(), index.metric(), &hnsw_index_raw);
-
-  std::unique_ptr<hnsw::index<float>> hnsw_index_deserialized(hnsw_index_raw);
-
-  std::cout << "Searching HNSW index." << std::endl;
-  hnsw::search(dev_resources,
-                 hnsw_search_params,
-                 *hnsw_index_deserialized,
-                 queries_host.view(),
-                 indices_hnsw_host.view(),
-                 distances_hnsw_host.view());
-
-  // Convert HNSW uint64_t indices back to uint32_t for printing
-  auto neighbors_host = raft::make_host_matrix<uint32_t, int64_t>(n_queries, topk);
-  for (int64_t i = 0; i < n_queries; i++) {
-    for (int64_t j = 0; j < topk; j++) {
-      neighbors_host(i, j) = static_cast<uint32_t>(indices_hnsw_host(i, j));
-    }
-  }
-
-  // Copy results to device
-  raft::copy(neighbors.data_handle(),
-             neighbors_host.data_handle(),
-             n_queries * topk,
-             raft::resource::get_cuda_stream(dev_resources));
-  raft::copy(distances.data_handle(),
-             distances_hnsw_host.data_handle(),
-             n_queries * topk,
-             raft::resource::get_cuda_stream(dev_resources));
-  raft::resource::sync_stream(dev_resources);
-
-  print_results(dev_resources, neighbors.view(), distances.view());
+  munmap(dataset_ptr, file_size);
+  close(fd);
   return 0;
 }
 
@@ -179,16 +127,6 @@ int main()
   // a pool with 2 GiB upper limit.
   // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
 
-  // Create input arrays.
-  int64_t n_samples = 1000;
-  int64_t n_dim     = 1536;
-  int64_t n_queries = 10;
-  auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
-  auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
-  generate_dataset(dev_resources, dataset.view(), queries.view());
-
   // ACE build and search example.
-  cagra_build_search_ace(dev_resources,
-                         raft::make_const_mdspan(dataset.view()),
-                         raft::make_const_mdspan(queries.view()));
+  cagra_build_search_ace(dev_resources);
 }
