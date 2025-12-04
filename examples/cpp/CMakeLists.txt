@@ -32,6 +32,8 @@ include(../cmake/thirdparty/get_cuvs.cmake)
 add_executable(BRUTE_FORCE_EXAMPLE src/brute_force_bitmap.cu)
 add_executable(CAGRA_EXAMPLE src/cagra_example.cu)
 add_executable(CAGRA_HNSW_ACE_EXAMPLE src/cagra_hnsw_ace_example.cu)
+add_executable(CAGRA_HNSW_ACE_BIGANN src/cagra_hnsw_ace_bigann.cu)
+add_executable(HNSW_OPENAI_EXAMPLE src/hnsw_openai_example.cu)
 add_executable(CAGRA_PERSISTENT_EXAMPLE src/cagra_persistent_example.cu)
 add_executable(DYNAMIC_BATCHING_EXAMPLE src/dynamic_batching_example.cu)
 add_executable(HNSW_ACE_EXAMPLE src/hnsw_ace_example.cu)
@@ -45,6 +47,10 @@ add_executable(SCANN_EXAMPLE src/scann_example.cu)
 target_link_libraries(BRUTE_FORCE_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(CAGRA_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
 target_link_libraries(CAGRA_HNSW_ACE_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+target_link_libraries(CAGRA_HNSW_ACE_BIGANN PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+
+target_link_libraries(HNSW_OPENAI_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env>)
+
 target_link_libraries(
   CAGRA_PERSISTENT_EXAMPLE PRIVATE cuvs::cuvs $<TARGET_NAME_IF_EXISTS:conda_env> Threads::Threads
 )

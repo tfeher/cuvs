@@ -104,7 +104,7 @@ void hnsw_build_search_ace(raft::device_resources const& dev_resources,
   std::cout << "Searching HNSW index" << std::endl;
   hnsw::search(dev_resources,
                search_params,
-               *hnsw_index_deserialized,
+               *hnsw_index,
                queries_host.view(),
                indices_host.view(),
                distances_host.view());
