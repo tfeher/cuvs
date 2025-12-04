@@ -30,12 +30,13 @@ int cagra_build_search_ace(raft::device_resources const& dev_resources)
 {
   using namespace cuvs::neighbors;
 
-  int64_t topk      = 12;
+  int64_t topk      = 10;
 
   // HNSW index parameters
   hnsw::index_params index_params;
   index_params.m = 24;
   index_params.ef_construction = 120;
+  index_params.hierarchy = hnsw::HnswHierarchy::GPU;
 
   // ACE index parameters
   auto ace_params = hnsw::graph_build_params::ace_params();
@@ -128,7 +129,13 @@ hnsw::index<float>* hnsw_index_raw = nullptr;
                indices_hnsw_host.view(),
                distances_hnsw_host.view());
 
-
+  for (int query_id = 0; query_id < std::min<int>(n_queries, 10); query_id++) {
+    std::cout << "Query " << query_id << " neighbor indices: ";
+    raft::print_host_vector("", &indices_hnsw_host(query_id, 0), topk, std::cout);
+    std::cout << "Query " << query_id << " neighbor distances: ";
+    raft::print_host_vector("", &distances_hnsw_host(query_id, 0), topk, std::cout);
+  }
+  
   munmap(dataset_ptr, file_size);
   close(fd);
   return 0;
