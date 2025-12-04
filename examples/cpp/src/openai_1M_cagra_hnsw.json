@@ -1,0 +1,99 @@
+{
+  "dataset": {
+    "name": "openai_5M",
+    "subset_size": 1000000,
+    "base_file": "openai_5M/base.5M.fbin",
+    "query_file": "openai_5M/queries.fbin",
+    "groundtruth_neighbors_file": "openai_5M/groundtruth.1M.neighbors.ibin",
+    "distance": "euclidean"
+  },
+  "search_basic_param": {
+    "batch_size": 10000,
+    "k": 10
+  },
+  "index": [
+              {
+                  "name": "cuvs_cagra_hnswlib_manual3",
+                  "algo": "cuvs_cagra_hnswlib",
+                  "build_param": { 
+                    "hierarchy": "gpu",
+                    "graph_degree": 32,
+                    "intermediate_graph_degree": 64,
+                    "graph_build_algo": "IVF_PQ",
+                    "ivf_pq_build_pq_dim": 0,
+                    "ivf_pq_build_pq_bits": 8,
+                    "ivf_pq_build_nlist": 1000,
+                    "ivf_pq_build_niter": 10,
+                    "ivf_pq_build_ratio": 2,
+                    "ivf_pq_search_nprobe": 20,
+                    "ivf_pq_search_internalDistanceDtype": "float",
+                    "ivf_pq_search_smemLutDtype": "fp8",
+                    "ivf_pq_search_refine_ratio": 2
+                  },
+                  "file": "openai_5M/cagra_hnswlib/manual3.ibin",
+                  "search_params": [
+                    {"ef":10},
+                    {"ef":20},
+                    {"ef":40},
+                    {"ef":60},
+                    {"ef":80},
+                    {"ef":120},
+                    {"ef":200},
+                    {"ef":400},
+                    {"ef":600},
+                    {"ef":800}
+                  ]
+                },
+                {
+                  "name": "cuvs_cagra_manual3",
+                  "algo": "cuvs_cagra",
+                  "build_param": { 
+                    "hierarchy": "gpu",
+                    "graph_degree": 32,
+                    "intermediate_graph_degree": 64,
+                    "graph_build_algo": "IVF_PQ",
+                    "ivf_pq_build_pq_dim": 0,
+                    "ivf_pq_build_pq_bits": 8,
+                    "ivf_pq_build_nlist": 1000,
+                    "ivf_pq_build_niter": 10,
+                    "ivf_pq_build_ratio": 2,
+                    "ivf_pq_search_nprobe": 20,
+                    "ivf_pq_search_internalDistanceDtype": "float",
+                    "ivf_pq_search_smemLutDtype": "fp8",
+                    "ivf_pq_search_refine_ratio": 2
+                  },
+                  "file": "openai_5M/cagra_hnswlib/manual3.ibin",
+                  "search_params": [
+                    { "itopk": 128, "search_width": 4, "max_iterations": 64, "algo": "single_cta", "graph_memory_type": "device",  "internal_dataset_memory_type": "device"  },
+                    { "itopk": 128, "search_width": 16, "max_iterations": 64, "algo": "single_cta", "graph_memory_type": "device",  "internal_dataset_memory_type": "device"  }    
+                  ]
+                },
+                {
+                  "name": "cuvs_ace",
+                  "algo": "cuvs_cagra_hnswlib",
+                  "build_param": { 
+                    "hierarchy": "gpu",
+                    "graph_degree": 48,
+                    "intermediate_graph_degree": 64,
+                    "graph_build_algo": "ACE",
+                    "ace_use_disk": true,
+                    "ace_build_dir": "/tmp/ace",
+                    "ace_npartitions": 10,
+                    "ef_construction": 120
+                  },
+                  "file": "openai_5M/cagra_hnswlib/ace.ibin",
+                  "search_params": [         
+                    {"ef":10},
+                    {"ef":20},
+                    {"ef":40},
+                    {"ef":60},
+                    {"ef":80},
+                    {"ef":120},
+                    {"ef":200},
+                    {"ef":400},
+                    {"ef":600},
+                    {"ef":800}
+                  ]
+                }                
+  ]
+}
